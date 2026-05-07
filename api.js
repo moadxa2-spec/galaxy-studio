@@ -1,8 +1,6 @@
 // ═══════════════════════════════════════════
 //  Galaxy Studio — api.js
 //  Streaming API calls — all providers
-//  Key forwarded via X-Upstream-Key header
-//  so our server never logs it in plaintext.
 // ═══════════════════════════════════════════
 
 let _abortController = null;
@@ -14,40 +12,6 @@ function abortCurrentRequest() {
 function newAbortSignal() {
   _abortController = new AbortController();
   return _abortController.signal;
-}
-
-// ── Supabase JWT for proxy auth ──
-function getSupabaseToken() {
-  try {
-    // Supabase stores session under keys like:
-    //   sb-<ref>-auth-token  (new SDKs)
-    //   supabase.auth.token  (older SDKs)
-    const keys = Object.keys(localStorage).filter(k =>
-      (k.startsWith('sb-') && k.endsWith('-auth-token')) ||
-      k.includes('supabase') && k.includes('auth')
-    );
-    for (const k of keys) {
-      const raw = localStorage.getItem(k);
-      if (!raw) continue;
-      const v = JSON.parse(raw);
-      // New SDK: { access_token, ... }
-      if (v?.access_token) return v.access_token;
-      // New SDK wraps in { currentSession: { access_token } }
-      if (v?.currentSession?.access_token) return v.currentSession.access_token;
-    }
-    return '';
-  } catch { return ''; }
-}
-
-function proxyHeaders(apiKey, provider) {
-  const h = {
-    'Content-Type': 'application/json',
-    'X-Upstream-Key': apiKey || ''
-  };
-  const jwt = getSupabaseToken();
-  if (jwt) h['Authorization'] = `Bearer ${jwt}`;
-  if (provider) h['X-Provider'] = provider;
-  return h;
 }
 
 // ═══════════════════════════════════════════
@@ -90,9 +54,10 @@ async function callGeminiStream(opts, onToken) {
   if (!opts.apiKey) throw new Error('Gemini API key required. Open Settings to add it.\n\nGet one free at: https://aistudio.google.com');
   const signal = newAbortSignal();
 
-  const res = await fetch(`/proxy/gemini/v1beta/models/${opts.model}:streamGenerateContent?alt=sse&key=${opts.apiKey}`, {
+  // Key goes in URL query param — no Authorization header needed
+  const res = await fetch(`/proxy/gemini/v1beta/models/${opts.model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(opts.apiKey)}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...proxyAuthHeaders() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: opts.systemPrompt }] },
       generationConfig: { maxOutputTokens: opts.maxTokens || 64000 },
@@ -118,12 +83,6 @@ async function callGeminiStream(opts, onToken) {
   }, onToken);
 }
 
-// Separate header helper — Gemini key goes in URL, not header
-function proxyAuthHeaders() {
-  const jwt = getSupabaseToken();
-  return jwt ? { 'Authorization': `Bearer ${jwt}` } : {};
-}
-
 // ═══════════════════════════════════════════
 //  ANTHROPIC (Claude)
 // ═══════════════════════════════════════════
@@ -132,15 +91,18 @@ async function callAnthropicStream(opts, onToken) {
   if (!opts.apiKey) throw new Error('Anthropic API key required. Open Settings to add it.\n\nGet one at: https://console.anthropic.com');
   const signal = newAbortSignal();
 
-  // Convert messages — system prompt is a separate param in Claude API
   const apiMessages = opts.messages.map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: m.content
   }));
 
+  // Server detects api.anthropic.com and converts Authorization: Bearer → x-api-key
   const res = await fetch('/proxy/anthropic/v1/messages', {
     method: 'POST',
-    headers: proxyHeaders(opts.apiKey, 'anthropic'),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${opts.apiKey}`
+    },
     body: JSON.stringify({
       model: opts.model,
       max_tokens: opts.maxTokens || 16000,
@@ -179,7 +141,10 @@ async function callOpenAIStream(opts, onToken) {
 
   const res = await fetch(`${baseRoute}/v1/chat/completions`, {
     method: 'POST',
-    headers: proxyHeaders(opts.apiKey, opts.provider),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${opts.apiKey}`
+    },
     body: JSON.stringify({
       model: opts.model,
       stream: true,
@@ -205,7 +170,7 @@ async function callOpenAIStream(opts, onToken) {
 }
 
 // ═══════════════════════════════════════════
-//  OLLAMA
+//  OLLAMA (Cloud + Local)
 // ═══════════════════════════════════════════
 
 async function callOllamaStream(opts, onToken) {
@@ -213,18 +178,18 @@ async function callOllamaStream(opts, onToken) {
 
   if (isCloud) {
     if (!opts.apiKey) throw new Error('Ollama Cloud API key required. Open Settings.\n\nGet one at: https://ollama.com/settings/keys');
-    // Route through server proxy with API key in X-Upstream-Key header
-    return callOllamaNative('/proxy/ollama', proxyHeaders(opts.apiKey, 'ollama-cloud'), opts, onToken);
+    // Send key directly in Authorization header — server forwards it
+    return callOllamaNative('/proxy/ollama', {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${opts.apiKey}`
+    }, opts, onToken);
   } else {
-    // Route Ollama Local through server-side proxy to avoid browser CORS restrictions
+    // Route through server-side proxy to avoid browser CORS restrictions
     const targetUrl = (opts.url || 'http://localhost:11434').replace(/\/$/, '');
-    const jwt = getSupabaseToken();
-    const headers = {
+    return callOllamaNative('/proxy/ollama-local', {
       'Content-Type': 'application/json',
       'X-Ollama-Url': targetUrl
-    };
-    if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
-    return callOllamaNative('/proxy/ollama-local', headers, opts, onToken);
+    }, opts, onToken);
   }
 }
 
@@ -271,32 +236,8 @@ async function callOllamaNative(baseUrl, headers, opts, onToken) {
   return { text, tokens };
 }
 
-async function callOllamaOpenAI(baseUrl, headers, opts, onToken) {
-  const signal = newAbortSignal();
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: opts.model, stream: true, max_tokens: opts.maxTokens || 64000,
-      messages: [{ role: 'system', content: opts.systemPrompt }, ...opts.messages]
-    }),
-    signal
-  });
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(parseApiErr(t, res.status));
-  }
-
-  return readSSE(res, line => {
-    if (line === '[DONE]') return null;
-    const j = JSON.parse(line);
-    const delta = j.choices?.[0]?.delta?.content || '';
-    return { text: delta, tokens: j.usage?.total_tokens || null };
-  }, onToken);
-}
-
 // ═══════════════════════════════════════════
-//  SSE READER
+//  SSE READER (shared)
 // ═══════════════════════════════════════════
 
 async function readSSE(res, parseLine, onToken) {
@@ -351,15 +292,12 @@ async function fetchAvailableModels(provider, apiKey, url) {
     ];
   }
   if (provider === 'openai') {
-    return [
-      'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo',
-      'o4-mini', 'o3-mini', 'o1-mini'
-    ];
+    return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o4-mini', 'o3-mini', 'o1-mini'];
   }
   if (provider === 'openrouter') {
     try {
       const res = await fetch('/proxy/openrouter/api/v1/models', {
-        headers: proxyHeaders(apiKey, 'openrouter')
+        headers: { 'Authorization': `Bearer ${apiKey}` }
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
@@ -370,8 +308,9 @@ async function fetchAvailableModels(provider, apiKey, url) {
   }
   if (provider === 'ollama-cloud') {
     try {
-      const headers = proxyHeaders(apiKey);
-      const res = await fetch('/proxy/ollama/api/tags', { headers });
+      const res = await fetch('/proxy/ollama/api/tags', {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       return (data.models || []).map(m => m.name).filter(Boolean);
@@ -380,10 +319,9 @@ async function fetchAvailableModels(provider, apiKey, url) {
   // ollama-local — route through server proxy to avoid CORS
   try {
     const targetUrl = (url || 'http://localhost:11434').replace(/\/$/, '');
-    const jwt = getSupabaseToken();
-    const headers = { 'X-Ollama-Url': targetUrl };
-    if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
-    const res = await fetch('/proxy/ollama-local/api/tags', { headers });
+    const res = await fetch('/proxy/ollama-local/api/tags', {
+      headers: { 'X-Ollama-Url': targetUrl }
+    });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     return (data.models || []).map(m => m.name).filter(Boolean);
@@ -402,9 +340,5 @@ function parseApiErr(text, status) {
     return `HTTP ${status}`;
   }
 }
-
-// Keep old function names for backward compat
-async function callGeminiStream_compat(opts, onToken) { return callGeminiStream(opts, onToken); }
-async function callOllamaStream_compat(opts, onToken) { return callOllamaStream(opts, onToken); }
 
 console.log('✦ api.js loaded');
