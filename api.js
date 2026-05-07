@@ -19,13 +19,21 @@ function newAbortSignal() {
 // ── Supabase JWT for proxy auth ──
 function getSupabaseToken() {
   try {
-    const sb = getSB();
-    if (!sb) return '';
-    // Access cached session token synchronously from localStorage key
-    const keys = Object.keys(localStorage).filter(k => k.includes('supabase') && k.includes('auth'));
+    // Supabase stores session under keys like:
+    //   sb-<ref>-auth-token  (new SDKs)
+    //   supabase.auth.token  (older SDKs)
+    const keys = Object.keys(localStorage).filter(k =>
+      (k.startsWith('sb-') && k.endsWith('-auth-token')) ||
+      k.includes('supabase') && k.includes('auth')
+    );
     for (const k of keys) {
-      const v = JSON.parse(localStorage.getItem(k) || 'null');
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      const v = JSON.parse(raw);
+      // New SDK: { access_token, ... }
       if (v?.access_token) return v.access_token;
+      // New SDK wraps in { currentSession: { access_token } }
+      if (v?.currentSession?.access_token) return v.currentSession.access_token;
     }
     return '';
   } catch { return ''; }
@@ -202,14 +210,21 @@ async function callOpenAIStream(opts, onToken) {
 
 async function callOllamaStream(opts, onToken) {
   const isCloud = opts.provider === 'ollama-cloud';
-  const baseUrl = isCloud ? '/proxy/ollama' : (opts.url || '').replace(/\/$/, '');
 
   if (isCloud) {
     if (!opts.apiKey) throw new Error('Ollama Cloud API key required. Open Settings.\n\nGet one at: https://ollama.com/settings/keys');
-    return callOllamaNative(baseUrl, proxyHeaders(opts.apiKey), opts, onToken);
+    // Route through server proxy with API key in X-Upstream-Key header
+    return callOllamaNative('/proxy/ollama', proxyHeaders(opts.apiKey, 'ollama-cloud'), opts, onToken);
   } else {
-    const headers = { 'Content-Type': 'application/json' };
-    return callOllamaOpenAI(baseUrl, headers, opts, onToken);
+    // Route Ollama Local through server-side proxy to avoid browser CORS restrictions
+    const targetUrl = (opts.url || 'http://localhost:11434').replace(/\/$/, '');
+    const jwt = getSupabaseToken();
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Ollama-Url': targetUrl
+    };
+    if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
+    return callOllamaNative('/proxy/ollama-local', headers, opts, onToken);
   }
 }
 
@@ -362,10 +377,13 @@ async function fetchAvailableModels(provider, apiKey, url) {
       return (data.models || []).map(m => m.name).filter(Boolean);
     } catch { return []; }
   }
-  // ollama-local
+  // ollama-local — route through server proxy to avoid CORS
   try {
-    const base = (url || 'http://localhost:11434').replace(/\/$/, '');
-    const res = await fetch(`${base}/api/tags`);
+    const targetUrl = (url || 'http://localhost:11434').replace(/\/$/, '');
+    const jwt = getSupabaseToken();
+    const headers = { 'X-Ollama-Url': targetUrl };
+    if (jwt) headers['Authorization'] = `Bearer ${jwt}`;
+    const res = await fetch('/proxy/ollama-local/api/tags', { headers });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     return (data.models || []).map(m => m.name).filter(Boolean);

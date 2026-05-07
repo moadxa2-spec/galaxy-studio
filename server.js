@@ -81,7 +81,11 @@ function proxyRequest(targetBase, req, res) {
   const upstreamKey = req.headers['x-upstream-key'] || '';
 
   const pathAfterProxy = req.path; // already stripped by route
-  const fullUrl = targetBase + pathAfterProxy + (req._parsedUrl.search || '');
+  // Rebuild query string from req.query to ensure nothing is lost
+  const queryStr = Object.keys(req.query).length > 0
+    ? '?' + new URLSearchParams(req.query).toString()
+    : '';
+  const fullUrl = targetBase + pathAfterProxy + queryStr;
 
   let url;
   try { url = new URL(fullUrl); } catch {
@@ -127,12 +131,16 @@ function proxyRequest(targetBase, req, res) {
     };
 
     const proxyReq = https.request(options, proxyRes => {
-      res.writeHead(proxyRes.statusCode, {
+      const resHeaders = {
         'Content-Type': proxyRes.headers['content-type'] || 'application/json',
-        'Transfer-Encoding': proxyRes.headers['transfer-encoding'] || '',
         'Cache-Control': 'no-cache',
         'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (req.headers.origin || '')
-      });
+      };
+      // Only forward Transfer-Encoding if present
+      if (proxyRes.headers['transfer-encoding']) {
+        resHeaders['Transfer-Encoding'] = proxyRes.headers['transfer-encoding'];
+      }
+      res.writeHead(proxyRes.statusCode, resHeaders);
       proxyRes.pipe(res, { end: true });
     });
 
@@ -141,6 +149,78 @@ function proxyRequest(targetBase, req, res) {
       if (!res.headersSent) {
         res.status(502).json({ error: `Proxy error: ${err.message}` });
       }
+    });
+
+    if (body.length > 0) proxyReq.write(body);
+    proxyReq.end();
+  });
+}
+
+// ── LOCAL OLLAMA PROXY (proxies to user-supplied host to avoid browser CORS) ──
+function proxyOllamaLocal(req, res) {
+  // Target URL comes from X-Ollama-Url header, validated to be HTTP/HTTPS
+  const rawTarget = req.headers['x-ollama-url'] || 'http://localhost:11434';
+  let targetOrigin;
+  try {
+    const u = new URL(rawTarget);
+    if (!['http:', 'https:'].includes(u.protocol)) throw new Error('bad protocol');
+    targetOrigin = u.origin; // e.g. http://localhost:11434
+  } catch {
+    return res.status(400).json({ error: 'Invalid X-Ollama-Url header.' });
+  }
+
+  const pathAfterProxy = req.path;
+  const fullUrl = targetOrigin + pathAfterProxy;
+  let url;
+  try { url = new URL(fullUrl); } catch {
+    return res.status(400).json({ error: 'Invalid proxy target URL.' });
+  }
+
+  const isHttps = url.protocol === 'https:';
+  const mod = isHttps ? https : require('http');
+  const port = url.port ? parseInt(url.port) : (isHttps ? 443 : 80);
+
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks);
+    const headers = {
+      'Content-Type': req.headers['content-type'] || 'application/json',
+      'User-Agent': 'GalaxyStudio/2.0'
+    };
+    if (body.length > 0) headers['Content-Length'] = body.length;
+
+    const options = {
+      hostname: url.hostname,
+      port,
+      path: url.pathname + url.search,
+      method: req.method,
+      headers
+    };
+
+    const proxyReq = mod.request(options, proxyRes => {
+      const resHeaders = {
+        'Content-Type': proxyRes.headers['content-type'] || 'application/json',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (req.headers.origin || '')
+      };
+      if (proxyRes.headers['transfer-encoding']) {
+        resHeaders['Transfer-Encoding'] = proxyRes.headers['transfer-encoding'];
+      }
+      res.writeHead(proxyRes.statusCode, resHeaders);
+      proxyRes.pipe(res, { end: true });
+    });
+
+    proxyReq.on('error', err => {
+      console.error('[ollama-local proxy error]', err.message);
+      if (!res.headersSent) {
+        res.status(502).json({ error: `Cannot reach Ollama at ${targetOrigin}: ${err.message}` });
+      }
+    });
+
+    proxyReq.setTimeout(120000, () => {
+      proxyReq.destroy();
+      if (!res.headersSent) res.status(408).json({ error: 'Ollama request timed out' });
     });
 
     if (body.length > 0) proxyReq.write(body);
@@ -167,6 +247,11 @@ app.use('/proxy/openai', requireAuth, proxyLimiter, (req, res) => {
 
 app.use('/proxy/openrouter', requireAuth, proxyLimiter, (req, res) => {
   proxyRequest('https://openrouter.ai', req, res);
+});
+
+// Local Ollama — proxied server-side to avoid browser CORS restrictions
+app.use('/proxy/ollama-local', requireAuth, proxyLimiter, (req, res) => {
+  proxyOllamaLocal(req, res);
 });
 
 // ── WEB SEARCH PROXY (uses DuckDuckGo Instant Answer API — no key needed) ──
@@ -257,6 +342,7 @@ app.listen(PORT, () => {
   console.log(`    /proxy/anthropic  → api.anthropic.com`);
   console.log(`    /proxy/openai     → api.openai.com`);
   console.log(`    /proxy/openrouter → openrouter.ai`);
-  console.log(`    /proxy/search     → DuckDuckGo (no key needed)`);
-  console.log(`    /proxy/fetch      → arbitrary URL fetcher\n`);
+  console.log(`    /proxy/search       → DuckDuckGo (no key needed)`);
+  console.log(`    /proxy/fetch        → arbitrary URL fetcher`);
+  console.log(`    /proxy/ollama-local → local Ollama (server-side proxy, no CORS)\n`);
 });
