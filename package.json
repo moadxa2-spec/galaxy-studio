@@ -1,0 +1,20 @@
+{
+  "name": "galaxy-studio",
+  "version": "2.0.0",
+  "description": "Galaxy Studio — AI App Builder. Merged Galaxy + Gemma Chat engine.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "echo 'No build step required — static files served directly by server.js'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

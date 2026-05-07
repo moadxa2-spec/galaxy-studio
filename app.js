@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════
-//  Galaxy Studio — app.js (Orchestrator)
+//  Galaxy Studio — app.js (Orchestrator v2)
+//  Merged Galaxy + Gemma Chat engine
 // ═══════════════════════════════════════════
 
 // ── STATE ──
 let currentProjectId = null;
 let messages = [];
 let currentCode = '';
-let currentFiles = {};   // { 'index.html': '...', 'styles.css': '...' }
+let currentFiles = {};
 let activeFile = '';
 let isStreaming = false;
 let activeTab = 'preview';
@@ -18,13 +19,15 @@ let thinkingTimer = null;
 let thinkingStartTime = 0;
 let currentPlan = null;
 let skillsIndex = {};
+let chatMode = 'build'; // 'build' | 'chat'
+let lastUserMessage = ''; // for regenerate
 
 // ── CONFIG ──
 const cfg = {
-  provider: localStorage.getItem('gs_provider') || 'ollama-local',
+  provider: localStorage.getItem('gs_provider') || 'gemini',
   url: localStorage.getItem('gs_url') || 'http://localhost:11434',
   apiKey: localStorage.getItem('gs_apikey') || '',
-  model: localStorage.getItem('gs_model') || ''
+  model: localStorage.getItem('gs_model') || 'gemini-2.5-flash-preview-04-17'
 };
 
 // ── PROMPTS ──
@@ -65,7 +68,7 @@ const SKILLS_WEB = `
 WEB APP BEST PRACTICES:
 - Semantic HTML5, accessible, responsive
 - Modern CSS (flexbox/grid, custom properties, smooth transitions)
-- Clean JavaScript
+- Clean JavaScript, no jQuery
 `;
 
 const PROMPT_BUILD = `You are Galaxy Studio, an expert full-stack developer. Build the complete application.
@@ -101,12 +104,19 @@ RULES:
 - Use <action name="edit_file"> to make targeted changes to specific files.
 - Use <action name="write_file"> if creating a new file or completely rewriting one.
 - Use <action name="read_file"> to inspect a file before editing it if you need context.
+- You may use web_search or fetch_url to look up anything you need.
 
 TOOLS:
 ${renderToolHelp()}
 `;
 
+const PROMPT_CHAT = `You are Galaxy Studio, a helpful AI assistant specializing in web development. You are in CHAT mode — answer questions, explain concepts, review code, give advice. Do NOT write or modify project files unless explicitly asked. Respond in clear markdown.`;
+
 // ── ORCHESTRATION ──
+
+function getMaxRounds() {
+  return chatMode === 'chat' ? MAX_AGENT_ROUNDS_CHAT : MAX_AGENT_ROUNDS_CODE;
+}
 
 function estimateTokens() {
   const allText = messages.map(m => m.content).join(' ').toLowerCase();
@@ -117,6 +127,7 @@ function estimateTokens() {
 }
 
 function getSystemPrompt() {
+  if (chatMode === 'chat') return PROMPT_CHAT;
   if (phase === 'planning') {
     const aiAskedQuestions = messages.some(m => m.role === 'assistant' && m.content.includes('QUESTIONS:'));
     const userAnswered = aiAskedQuestions && messages.filter(m => m.role === 'user').length >= 2;
@@ -126,28 +137,26 @@ function getSystemPrompt() {
   return basePrompt + '\n\n' + SKILLS_WEB;
 }
 
-/**
- * Handle the result of a build/refine generation round
- */
 function handleBuildResult(text, tokens, userText, secs) {
-  // If the AI completely ignored tools and used the old ===FILE: format,
-  // or wrapped everything in code fences, fallback to parser.js
   if (text.includes('===FILE:') || text.includes('\`\`\`html')) {
     const extracted = extractProject(text);
-    if (Object.keys(extracted).length > 0) {
-      Object.assign(currentFiles, extracted);
-    }
+    if (Object.keys(extracted).length > 0) Object.assign(currentFiles, extracted);
   }
 
   currentCode = Object.values(currentFiles).join('\n');
   messages.push({ role: 'assistant', content: text });
-  versions.push({ files: {...currentFiles}, prompt: userText, timestamp: Date.now() });
+
+  const versionData = { files: { ...currentFiles }, prompt: userText, timestamp: Date.now(), model: cfg.model, tokens };
+  versions.push(versionData);
   currentVersion = versions.length - 1;
   updateVersionNav();
 
-  const totalLines = Object.values(currentFiles).reduce((s,c) => s + c.split('\n').length, 0);
+  // Persist version to Supabase
+  persistVersion(currentProjectId, currentVersion, versionData);
+
+  const totalLines = Object.values(currentFiles).reduce((s, c) => s + c.split('\n').length, 0);
   const fileCount = Object.keys(currentFiles).length;
-  let summary = `✓ Built in ${secs}s — ${fileCount} files, ${totalLines} lines`;
+  let summary = `Built in ${secs}s — ${fileCount} files, ${totalLines} lines`;
   if (tokens) summary += ` · ${tokens} tokens`;
 
   appendMsg('assistant', summary);
@@ -158,11 +167,9 @@ function handleBuildResult(text, tokens, userText, secs) {
   phase = 'refining';
   updatePhaseUI();
   saveCurrentProject();
+  if (tokens) logUsage(cfg.provider, cfg.model, 0, tokens);
 }
 
-/**
- * Plan approval — triggered by Approve & Build button in plan card
- */
 function approvePlan() {
   if (isStreaming) return;
   phase = 'building';
@@ -171,30 +178,37 @@ function approvePlan() {
   sendMessage();
 }
 
-/**
- * Plan modification — triggered by Modify Plan button in plan card
- */
 function modifyPlan() {
   if (isStreaming) return;
   promptEl.value = 'I want to change the plan: ';
   promptEl.focus();
-  // Move cursor to end
   promptEl.selectionStart = promptEl.selectionEnd = promptEl.value.length;
 }
 
-/**
- * Main Agent Tool Loop — fixed to run tools AFTER stream completes, not inside callback
- */
+function regenerateLast() {
+  if (isStreaming || !lastUserMessage) return;
+  // Remove last assistant message from messages array
+  while (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
+    messages.pop();
+  }
+  promptEl.value = lastUserMessage;
+  sendMessage();
+}
+
+// ── MAIN AGENT LOOP ──
 async function sendMessage() {
   if (isStreaming) return;
   if (!cfg.model) { openModal('settingsOverlay'); return; }
   const userText = promptEl.value.trim();
   if (!userText) return;
 
+  // Warn if streaming will navigate away
+  window._pendingStream = true;
+
   promptEl.value = '';
+  lastUserMessage = userText;
   isStreaming = true;
 
-  // Show Stop Button
   sendBtn.classList.add('hidden');
   const stopBtn = $('stopBtn');
   if (stopBtn) stopBtn.classList.remove('hidden');
@@ -203,20 +217,20 @@ async function sendMessage() {
   appendMsg('user', userText);
   appendThinking();
   messages.push({ role: 'user', content: userText });
+  persistMessage(currentProjectId, { role: 'user', content: userText, model: cfg.model });
 
-  const isToolMode = (phase === 'building' || phase === 'refining');
+  const isToolMode = chatMode === 'build' && (phase === 'building' || phase === 'refining');
   let roundCount = 0;
 
   const ctx = {
     files: currentFiles,
-    onFileWrite: (path, content, done) => {
-      renderLiveCode(path, content, done);
-    }
+    onFileWrite: (path, content, done) => { renderLiveCode(path, content, done); }
   };
 
   try {
-    while (roundCount < MAX_AGENT_ROUNDS && isStreaming) {
+    while (roundCount < getMaxRounds() && isStreaming) {
       roundCount++;
+
       const opts = {
         provider: cfg.provider,
         url: cfg.url,
@@ -230,56 +244,68 @@ async function sendMessage() {
       let currentResponse = '';
       let totalTokens = 0;
       let lastRenderedLength = 0;
-      let actionFoundMidStream = false;
 
-      // The bubble for the current AI response
+      // Create streaming bubble
       const replyDiv = document.createElement('div');
       replyDiv.className = 'msg assistant tool-round';
-      replyDiv.innerHTML = `<div class="msg-role">${esc(cfg.model || 'AI')}</div><div class="msg-bubble formatted"></div>`;
+      replyDiv.innerHTML = `<div class="msg-role">${esc(cfg.model || 'AI')}</div><div class="msg-bubble formatted markdown-body"></div>`;
       const bubble = replyDiv.querySelector('.msg-bubble');
       chatHistory.appendChild(replyDiv);
 
-      const streamFn = cfg.provider === 'gemini' ? callGeminiStream : callOllamaStream;
+      // Tool activity badge container
+      const activityBar = document.createElement('div');
+      activityBar.className = 'tool-activity-bar';
+      replyDiv.appendChild(activityBar);
 
-      // Stream the full response — tools are NOT run inside this callback.
-      // We collect everything, then process actions after the stream ends.
-      const res = await streamFn(opts, (chunk) => {
-        currentResponse += chunk;
+      function showActivity(text) {
+        activityBar.innerHTML = `<span class="tool-badge running">${esc(text)}</span>`;
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+      }
+      function clearActivity() { activityBar.innerHTML = ''; }
 
-        if (isToolMode) {
-          // Stream visible text up to the start of any forming <action> tag
-          const safeLen = emitSafeBoundary(currentResponse, lastRenderedLength);
-          if (safeLen > lastRenderedLength) {
-            const safeChunk = currentResponse.slice(lastRenderedLength, safeLen);
-            bubble.textContent += safeChunk;
-            lastRenderedLength = safeLen;
+      const res = await streamChat(opts, (chunk) => {
+        if (chunk.type === 'token') {
+          currentResponse += chunk.data;
+
+          if (isToolMode) {
+            const safeLen = emitSafeBoundary(currentResponse, lastRenderedLength);
+            if (safeLen > lastRenderedLength) {
+              const safeText = currentResponse.slice(lastRenderedLength, safeLen);
+              renderMarkdownChunk(bubble, safeText);
+              lastRenderedLength = safeLen;
+              chatHistory.scrollTop = chatHistory.scrollHeight;
+            }
+
+            // Live-write: stream file content as model writes it
+            const incompleteAction = findNextAction(currentResponse, 0);
+            if (incompleteAction === 'incomplete') {
+              const openTag = currentResponse.match(/<action\s+name\s*=\s*["']?write_file["']?\s*>/i);
+              const pathMatch = currentResponse.match(/<path>([\s\S]*?)<\/path>/i);
+              const contentOpen = currentResponse.lastIndexOf('<content>');
+              if (openTag && pathMatch && contentOpen > openTag.index) {
+                const filePath = normalizePath(pathMatch[1]);
+                const rawContent = currentResponse.slice(contentOpen + 9);
+                const displayContent = rawContent.replace(/<\/content>[\s\S]*$/, '');
+                showActivity(`writing ${filePath}...`);
+                ctx.onFileWrite(filePath, displayContent, false);
+              }
+            }
+          } else {
+            // Planning / chat mode: stream markdown directly
+            bubble.innerHTML = renderMarkdown(currentResponse);
             chatHistory.scrollTop = chatHistory.scrollHeight;
           }
-
-          // While streaming a write_file action, pipe content to the live code view
-          const incompleteAction = findNextAction(currentResponse, 0);
-          if (incompleteAction === 'incomplete') {
-            const openTag = currentResponse.match(/<action\s+name\s*=\s*["']?write_file["']?\s*>/i);
-            const pathMatch = currentResponse.match(/<path>([\s\S]*?)<\/path>/i);
-            const contentOpen = currentResponse.lastIndexOf('<content>');
-            if (openTag && pathMatch && contentOpen > openTag.index) {
-              const path = normalizePath(pathMatch[1]);
-              const rawContent = currentResponse.slice(contentOpen + 9);
-              const displayContent = rawContent.replace(/<\/content>[\s\S]*$/, '');
-              ctx.onFileWrite(path, displayContent, false);
-            }
-          }
-        } else {
-          // Planning mode: stream text directly
-          bubble.textContent += chunk;
-          chatHistory.scrollTop = chatHistory.scrollHeight;
+        } else if (chunk.type === 'activity') {
+          showActivity(chunk.data);
+        } else if (chunk.type === 'done') {
+          totalTokens = chunk.data?.tokens || totalTokens;
         }
       });
 
       totalTokens = res?.tokens || totalTokens;
+      clearActivity();
 
       // ── POST-STREAM TOOL PROCESSING ──
-      // Now that the stream is complete, scan for all actions and execute them in order.
       if (isToolMode) {
         let searchFrom = 0;
         let toolsExecuted = 0;
@@ -288,35 +314,52 @@ async function sendMessage() {
           const actionData = findNextAction(currentResponse, searchFrom);
           if (!actionData || actionData === 'incomplete') break;
 
-          const result = runTool(actionData.name, actionData.args, ctx);
+          showActivity(`${actionData.name}(${actionData.args.path || actionData.args.query || ''})`);
 
-          // Mark live file as done rendering
-          if (actionData.name === 'write_file' || actionData.name === 'edit_file') {
-            const p = actionData.args.path;
-            if (p && ctx.files[p]) ctx.onFileWrite(p, ctx.files[p], true);
+          let result;
+          const tool = TOOLS[actionData.name];
+          if (tool?.run?.constructor?.name === 'AsyncFunction') {
+            result = await TOOLS[actionData.name].run(actionData.args, ctx);
+          } else {
+            result = runTool(actionData.name, actionData.args, ctx);
           }
 
-          bubble.innerHTML += `<div class="tool-result">🔨 ${actionData.name}(${actionData.args.path || ''}) → ${esc(String(result).slice(0, 80))}</div>`;
-          toolsExecuted++;
-          actionFoundMidStream = true;
+          // Mark file done
+          if ((actionData.name === 'write_file' || actionData.name === 'edit_file') && actionData.args.path) {
+            const fp = normalizePath(actionData.args.path);
+            if (ctx.files[fp]) ctx.onFileWrite(fp, ctx.files[fp], true);
+          }
 
-          // Advance past the processed action so we don't re-run it
+          const resultShort = String(result).slice(0, 120);
+          const badge = document.createElement('div');
+          badge.className = 'tool-result';
+          badge.innerHTML = `<span class="tool-badge done">${esc(actionData.name)}</span> <span class="tool-result-text">${esc(resultShort)}</span>`;
+          replyDiv.appendChild(badge);
+          toolsExecuted++;
           searchFrom = actionData.end;
         }
 
+        clearActivity();
+
         if (toolsExecuted > 0) {
-          // Push assistant response and tool results, then loop for next round
           messages.push({ role: 'assistant', content: currentResponse });
-          messages.push({ role: 'user', content: `Tool results processed (${toolsExecuted} action(s)). Continue generating remaining files or respond with any follow-up.` });
+          messages.push({ role: 'user', content: `Tool results processed (${toolsExecuted} action(s)). Continue with any remaining files or tasks.` });
           continue;
         }
       }
 
-      // No tool actions found — response is complete
+      // ── RESPONSE COMPLETE ──
       removeThinking();
       const secs = Math.round((Date.now() - thinkingStartTime) / 1000);
 
-      if (phase === 'planning') {
+      // Final markdown render (replace partial streaming render with full clean render)
+      bubble.innerHTML = renderMarkdown(currentResponse.replace(/<action[\s\S]*?<\/action>/gi, '').trim());
+
+      if (chatMode === 'chat') {
+        messages.push({ role: 'assistant', content: currentResponse });
+        persistMessage(currentProjectId, { role: 'assistant', content: currentResponse, model: cfg.model });
+        if (totalTokens) showTokenBadge(totalTokens);
+      } else if (phase === 'planning') {
         if (currentResponse.includes('PLAN:')) {
           currentPlan = currentResponse;
           messages.push({ role: 'assistant', content: currentResponse });
@@ -329,41 +372,59 @@ async function sendMessage() {
         handleBuildResult(currentResponse, totalTokens, userText, secs);
       }
 
-      break; // Exit the while loop
+      break;
     }
 
-    if (roundCount >= MAX_AGENT_ROUNDS) {
-      appendMsg('assistant', '⚠ Max agent rounds reached.');
+    if (roundCount >= getMaxRounds()) {
+      appendMsg('assistant', 'Max agent rounds reached. The model may need more specific instructions.');
     }
 
     setStatus('ok');
   } catch (err) {
-    if (err.name === 'AbortError' || err.message.includes('abort')) {
-      appendMsg('assistant', '🛑 Generation cancelled by user.');
+    if (err.name === 'AbortError' || err.message?.includes('abort')) {
+      appendMsg('assistant', 'Generation stopped.');
       setStatus('ok');
     } else {
       setStatus('err');
-      appendMsg('assistant', '⚠ Error: ' + err.message);
+      appendMsg('assistant', 'Error: ' + err.message);
       console.error(err);
     }
   } finally {
     removeThinking();
     isStreaming = false;
+    window._pendingStream = false;
     if (stopBtn) stopBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
     sendBtn.disabled = false;
   }
 }
 
+// ── MARKDOWN RENDERING ──
+function renderMarkdown(text) {
+  if (window.marked) {
+    try {
+      return window.marked.parse(text, { breaks: true, gfm: true });
+    } catch { /* fall through */ }
+  }
+  return esc(text).replace(/\n/g, '<br>');
+}
+
+function renderMarkdownChunk(el, chunk) {
+  // Append raw text and re-render whole bubble content for streaming
+  el.dataset.raw = (el.dataset.raw || '') + chunk;
+  el.innerHTML = renderMarkdown(el.dataset.raw);
+}
+
 // ═══════════ PROJECT MANAGEMENT ═══════════
 
-function saveCurrentProject() {
-  saveProject(currentProjectId, {
+async function saveCurrentProject() {
+  const name = $('projectBadge')?.textContent || 'Untitled';
+  await saveProject(currentProjectId, {
     messages, versions, currentVersion, currentCode, currentFiles,
-    phase, provider: cfg.provider, model: cfg.model,
-    name: $('projectBadge').textContent
+    phase, name, description: ''
   });
-  renderProjectSidebar(listProjects());
+  const list = await listProjects();
+  renderProjectSidebar(list);
 }
 
 function newProject() {
@@ -373,7 +434,7 @@ function newProject() {
   currentProjectId = generateProjectId();
   messages = []; currentCode = ''; currentFiles = {}; activeFile = '';
   versions = []; currentVersion = -1; consoleLines = [];
-  phase = 'planning'; currentPlan = null;
+  phase = 'planning'; currentPlan = null; chatMode = 'build';
 
   $('fileTabs').innerHTML = '';
   chatHistory.innerHTML = '';
@@ -391,13 +452,23 @@ function newProject() {
   $('projectBadge').textContent = 'Untitled';
 
   updatePhaseUI();
+  updateModeToggle();
   setStatus('');
   saveCurrentProject();
+  loadAndRenderTemplates();
 }
 
-function switchProject(id) {
+async function switchProject(id) {
   if (isStreaming) return;
-  const p = loadProjectById(id);
+
+  let p;
+  if (typeof id === 'object' && id !== null) {
+    // Called with a project data object directly
+    p = id;
+    id = p.id;
+  } else {
+    p = await loadProjectById(id);
+  }
   if (!p) return;
 
   currentProjectId = p.id;
@@ -410,19 +481,17 @@ function switchProject(id) {
   phase = p.phase || (currentCode ? 'refining' : 'planning');
   $('projectBadge').textContent = p.name || 'Untitled';
 
-  // UI Resets
   chatHistory.innerHTML = '';
   emptyChat.classList.toggle('hidden', messages.length > 0);
   if (messages.length === 0) chatHistory.appendChild(emptyChat);
 
-  // Replay chat (truncate long code blocks for readability)
   messages.forEach(m => {
     if (m.role === 'user' || m.role === 'assistant') {
       let content = m.content;
       if (m.role === 'assistant' && content.length > 2000) {
-         content = content.slice(0, 1000) + '\n\n...[code generation hidden for readability]...\n\n' + content.slice(-500);
+        content = content.slice(0, 1000) + '\n\n...[code generation hidden for readability]...\n\n' + content.slice(-500);
       }
-      appendMsg(m.role, content);
+      appendMsg(m.role, content, true);
     }
   });
 
@@ -436,17 +505,18 @@ function switchProject(id) {
 
   updateVersionNav();
   updatePhaseUI();
-  renderProjectSidebar(listProjects());
+  updateModeToggle();
+  const list = await listProjects();
+  renderProjectSidebar(list);
 }
 
-// ═══════════ DOWNLOAD HELPER ═══════════
+// ═══════════ DOWNLOAD / EXPORT ═══════════
 
 async function downloadProject() {
   const names = Object.keys(currentFiles);
-  if (names.length === 0) { alert('No files to download yet.'); return; }
+  if (names.length === 0) { showToast('No files to download yet.', 'error'); return; }
 
   if (names.length === 1) {
-    // Single file — plain download
     const name = names[0];
     const blob = new Blob([currentFiles[name]], { type: 'text/plain' });
     const a = document.createElement('a');
@@ -457,7 +527,6 @@ async function downloadProject() {
     return;
   }
 
-  // Multiple files — zip via JSZip if available
   if (window.JSZip) {
     const zip = new JSZip();
     names.forEach(n => zip.file(n, currentFiles[n]));
@@ -468,7 +537,6 @@ async function downloadProject() {
     a.click();
     URL.revokeObjectURL(a.href);
   } else {
-    // Fallback: download just the HTML file
     const htmlFile = names.find(n => n.endsWith('.html')) || names[0];
     const blob = new Blob([currentFiles[htmlFile]], { type: 'text/html' });
     const a = document.createElement('a');
@@ -479,40 +547,59 @@ async function downloadProject() {
   }
 }
 
-// ═══════════ FETCH MODELS ═══════════
+// ═══════════ SHARE ═══════════
+
+async function toggleShareProject() {
+  const proj = await loadProjectById(currentProjectId);
+  if (!proj) return;
+  const newIsPublic = !proj.isPublic;
+  const slug = await setProjectPublic(currentProjectId, newIsPublic);
+  if (newIsPublic && slug) {
+    const shareUrl = `${window.location.origin}/p/${slug}`;
+    await navigator.clipboard.writeText(shareUrl).catch(() => {});
+    showToast('Share link copied: ' + shareUrl);
+  } else {
+    showToast('Project is now private.');
+  }
+  saveCurrentProject();
+}
+
+// ═══════════ TEMPLATES ═══════════
+
+async function loadAndRenderTemplates() {
+  const templateGrid = $('templateGrid');
+  if (!templateGrid) return;
+
+  const templates = await loadTemplates();
+  if (!templates || templates.length === 0) return;
+
+  templateGrid.innerHTML = templates.map(t => `
+    <button class="template-card" data-prompt="${esc(t.prompt || t.name)}">
+      <span class="template-icon">${esc(t.icon || '✦')}</span>
+      <span class="template-label">${esc(t.name)}</span>
+    </button>
+  `).join('');
+
+  templateGrid.querySelectorAll('.template-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const prompt = card.dataset.prompt;
+      if (prompt) { promptEl.value = prompt; promptEl.focus(); }
+    });
+  });
+}
+
+// ═══════════ MODELS ═══════════
 
 async function fetchModels() {
   const p = providerSelect.value;
   fetchBtn.textContent = '…';
   fetchBtn.disabled = true;
-
   try {
-    if (p === 'gemini') {
-      // Gemini model list via proxy or hardcoded defaults
-      const models = [
-        'gemini-2.0-flash-exp',
-        'gemini-1.5-pro',
-        'gemini-1.5-flash',
-        'gemini-1.0-pro'
-      ];
-      populateModelSelect(models);
-    } else {
-      // Ollama: GET /api/tags (local hits the Ollama server directly via proxy)
-      const isCloud = p === 'ollama-cloud';
-      const baseUrl = isCloud ? '/proxy/ollama' : (ollamaUrlInput.value.trim() || 'http://localhost:11434');
-      const headers = {};
-      if (isCloud && apiKeyInput.value.trim()) {
-        headers['Authorization'] = `Bearer ${apiKeyInput.value.trim()}`;
-      }
-      const res = await fetch(`${baseUrl}/api/tags`, { headers });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const models = (data.models || []).map(m => m.name).filter(Boolean);
-      if (models.length === 0) throw new Error('No models found');
-      populateModelSelect(models);
-    }
+    const models = await fetchAvailableModels(p, apiKeyInput.value.trim(), ollamaUrlInput.value.trim());
+    if (models.length === 0) throw new Error('No models found');
+    populateModelSelect(models);
   } catch (e) {
-    alert('Could not fetch models: ' + e.message);
+    showToast('Could not fetch models: ' + e.message, 'error');
   } finally {
     fetchBtn.textContent = '↻ Fetch';
     fetchBtn.disabled = false;
@@ -526,9 +613,7 @@ function populateModelSelect(models) {
     o.value = name; o.textContent = name;
     modelSelect.appendChild(o);
   });
-  if (cfg.model && models.includes(cfg.model)) {
-    modelSelect.value = cfg.model;
-  }
+  if (cfg.model && models.includes(cfg.model)) modelSelect.value = cfg.model;
   modelSelect.classList.remove('hidden');
   modelInput.classList.add('hidden');
 }
@@ -540,19 +625,42 @@ function updateSettingsUI() {
   $('settingHost').classList.toggle('hidden', p !== 'ollama-local');
   $('settingApiKey').classList.toggle('hidden', p === 'ollama-local');
 
-  if (p === 'gemini') {
-    $('apiKeyHint') && ($('apiKeyHint').textContent = 'Get your key at aistudio.google.com');
-    modelSelect.classList.add('hidden');
-    modelInput.classList.remove('hidden');
-    modelInput.placeholder = 'e.g. gemini-2.0-flash-exp';
-  } else if (p === 'ollama-cloud') {
-    $('apiKeyHint') && ($('apiKeyHint').textContent = 'Your Ollama Cloud API key');
-    modelSelect.classList.remove('hidden');
-    modelInput.classList.add('hidden');
-  } else {
-    modelSelect.classList.remove('hidden');
-    modelInput.classList.add('hidden');
+  const hints = {
+    gemini: 'Get a free key at aistudio.google.com',
+    'ollama-cloud': 'Your Ollama Cloud API key — ollama.com/settings/keys',
+    anthropic: 'Your Anthropic key — console.anthropic.com',
+    openai: 'Your OpenAI API key — platform.openai.com',
+    openrouter: 'Your OpenRouter key — openrouter.ai/keys'
+  };
+  const modelInputs = {
+    gemini: 'e.g. gemini-2.5-flash-preview-04-17',
+    anthropic: 'e.g. claude-sonnet-4-5',
+    openai: 'e.g. gpt-4o',
+    openrouter: 'e.g. openai/gpt-4o'
+  };
+
+  $('apiKeyHint') && ($('apiKeyHint').textContent = hints[p] || 'Your API key');
+
+  if (p === 'gemini' || p === 'anthropic' || p === 'openai') {
+    modelInput.placeholder = modelInputs[p] || '';
+    // Show both select and input — prefetch or allow manual entry
   }
+}
+
+// ═══════════ MODE TOGGLE ═══════════
+
+function updateModeToggle() {
+  const btn = $('modeToggle');
+  if (!btn) return;
+  btn.dataset.mode = chatMode;
+  btn.textContent = chatMode === 'chat' ? 'Chat Mode' : 'Build Mode';
+  btn.classList.toggle('chat-mode', chatMode === 'chat');
+}
+
+function toggleChatMode() {
+  chatMode = chatMode === 'build' ? 'chat' : 'build';
+  updateModeToggle();
+  updatePhaseUI();
 }
 
 // ═══════════ CONSOLE CAPTURE ═══════════
@@ -560,7 +668,6 @@ function updateSettingsUI() {
 window.addEventListener('message', (e) => {
   if (!e.data || e.data.type !== 'gs-console') return;
   const { method, args } = e.data;
-
   consoleLines.push({ method, args, time: Date.now() });
 
   const out = $('consoleOutput');
@@ -574,10 +681,18 @@ window.addEventListener('message', (e) => {
   out.appendChild(line);
   out.scrollTop = out.scrollHeight;
 
-  // Update badge count
   const countEl = $('consoleCount');
   countEl.textContent = consoleLines.length;
   countEl.classList.remove('hidden');
+});
+
+// ═══════════ BEFOREUNLOAD ═══════════
+
+window.addEventListener('beforeunload', e => {
+  if (window._pendingStream || isStreaming) {
+    e.preventDefault();
+    e.returnValue = 'Generation is still running. Leave anyway?';
+  }
 });
 
 // ═══════════ EVENT LISTENERS ═══════════
@@ -595,7 +710,6 @@ if (stopBtn) {
   };
 }
 
-// Tab switching
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     const target = tab.dataset.tab;
@@ -605,18 +719,6 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// Template card click — auto-fill prompt
-document.querySelectorAll('.template-card').forEach(card => {
-  card.addEventListener('click', () => {
-    const prompt = card.dataset.prompt;
-    if (prompt) {
-      promptEl.value = prompt;
-      promptEl.focus();
-    }
-  });
-});
-
-// Device toggle buttons
 document.querySelectorAll('.device-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.device-btn').forEach(b => b.classList.remove('active'));
@@ -634,7 +736,6 @@ document.querySelectorAll('.device-btn').forEach(btn => {
   });
 });
 
-// Copy button
 $('btnCopy').onclick = () => {
   const file = currentFiles[activeFile] || Object.values(currentFiles)[0] || currentCode;
   if (!file) return;
@@ -644,7 +745,6 @@ $('btnCopy').onclick = () => {
     btn.querySelector('span').textContent = 'Copied!';
     setTimeout(() => { btn.querySelector('span').textContent = orig; }, 1500);
   }).catch(() => {
-    // Fallback for older browsers
     const ta = document.createElement('textarea');
     ta.value = file;
     document.body.appendChild(ta);
@@ -654,17 +754,14 @@ $('btnCopy').onclick = () => {
   });
 };
 
-// Download button
 $('btnDownload').onclick = downloadProject;
 
-// Console clear
 $('consoleClear').onclick = () => {
   consoleLines = [];
   $('consoleOutput').innerHTML = '<div class="console-empty">No console output yet.</div>';
   $('consoleCount').classList.add('hidden');
 };
 
-// Version navigation
 $('verPrev').onclick = () => {
   if (currentVersion > 0) {
     currentVersion--;
@@ -688,14 +785,12 @@ $('verNext').onclick = () => {
   }
 };
 
-// Fetch models button
 fetchBtn.onclick = fetchModels;
 
 // Resizable panels
 const handle = $('resizeHandle');
 const leftPanel = $('leftPanel');
 let isResizing = false;
-
 handle.addEventListener('mousedown', e => {
   isResizing = true;
   handle.classList.add('active');
@@ -718,7 +813,7 @@ document.addEventListener('mouseup', () => {
   }
 });
 
-// Shortcuts
+// Keyboard shortcuts
 document.addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 's') { e.preventDefault(); downloadProject(); }
   if (e.ctrlKey && e.shiftKey && e.key === 'C') { e.preventDefault(); $('btnCopy').click(); }
@@ -727,9 +822,11 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === '/') { e.preventDefault(); openModal('shortcutsOverlay'); }
   if (e.ctrlKey && e.key === '[') { e.preventDefault(); $('verPrev').click(); }
   if (e.ctrlKey && e.key === ']') { e.preventDefault(); $('verNext').click(); }
+  if (e.ctrlKey && e.shiftKey && e.key === 'R') { e.preventDefault(); regenerateLast(); }
   if (e.key === 'Escape') {
     closeModal('settingsOverlay');
     closeModal('shortcutsOverlay');
+    closeModal('authOverlay');
     if (isStreaming) abortCurrentRequest();
   }
 });
@@ -744,7 +841,7 @@ $('btnSettings').onclick = () => openModal('settingsOverlay');
 $('btnShortcuts').onclick = () => openModal('shortcutsOverlay');
 $('shortcutsClose').onclick = () => closeModal('shortcutsOverlay');
 
-$('settingsSave').onclick = () => {
+$('settingsSave').onclick = async () => {
   cfg.provider = providerSelect.value;
   cfg.url = ollamaUrlInput.value.trim() || 'http://localhost:11434';
   cfg.apiKey = apiKeyInput.value.trim();
@@ -753,20 +850,28 @@ $('settingsSave').onclick = () => {
   localStorage.setItem('gs_url', cfg.url);
   localStorage.setItem('gs_apikey', cfg.apiKey);
   localStorage.setItem('gs_model', cfg.model);
+  await saveUserSettings({ provider: cfg.provider, model: cfg.model });
   updateTopbar();
   closeModal('settingsOverlay');
 };
+
 $('providerPill').onclick = () => openModal('settingsOverlay');
 $('modelPill').onclick = () => openModal('settingsOverlay');
 $('settingsClose').onclick = () => closeModal('settingsOverlay');
 
 function updateTopbar() {
-  const names = { 'ollama-local': 'Local Ollama', 'ollama-cloud': 'Ollama Cloud', 'gemini': 'Gemini API' };
+  const names = {
+    'ollama-local': 'Local Ollama',
+    'ollama-cloud': 'Ollama Cloud',
+    'gemini': 'Gemini',
+    'anthropic': 'Claude',
+    'openai': 'OpenAI',
+    'openrouter': 'OpenRouter'
+  };
   providerLabel.textContent = names[cfg.provider] || cfg.provider;
   modelLabel.textContent = cfg.model || 'No Model';
 }
 
-// Settings UI init
 providerSelect.value = cfg.provider;
 ollamaUrlInput.value = cfg.url;
 apiKeyInput.value = cfg.apiKey;
@@ -779,6 +884,24 @@ if (cfg.model) {
 providerSelect.addEventListener('change', updateSettingsUI);
 updateSettingsUI();
 
+// Add new provider options if not present
+(function patchProviderSelect() {
+  const existing = Array.from(providerSelect.options).map(o => o.value);
+  const toAdd = [
+    ['anthropic', 'Anthropic Claude'],
+    ['openai', 'OpenAI'],
+    ['openrouter', 'OpenRouter']
+  ];
+  toAdd.forEach(([val, label]) => {
+    if (!existing.includes(val)) {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = label;
+      providerSelect.appendChild(o);
+    }
+  });
+  providerSelect.value = cfg.provider;
+})();
+
 // Theme
 $('btnTheme').onclick = () => {
   const current = document.documentElement.getAttribute('data-theme');
@@ -790,22 +913,79 @@ if (localStorage.getItem('gs_theme') === 'light') {
   document.documentElement.setAttribute('data-theme', 'light');
 }
 
-// Window init
-window.onload = () => {
-  updateTopbar();
+// Share button (wired in HTML; also wire here as fallback)
+const btnShare = $('btnShare');
+if (btnShare) btnShare.onclick = toggleShareProject;
 
-  const migratedId = migrateOldProject();
-  if (migratedId) {
-    switchProject(migratedId);
-  } else {
-    const list = listProjects();
-    if (list.length > 0) {
-      switchProject(list[0].id);
-    } else {
-      newProject();
-    }
+// Regenerate button
+const btnRegen = $('btnRegen');
+if (btnRegen) btnRegen.onclick = regenerateLast;
+
+// Mode toggle
+const modeToggle = $('modeToggle');
+if (modeToggle) modeToggle.onclick = toggleChatMode;
+
+// User menu
+const userMenuBtn = $('userMenuBtn');
+if (userMenuBtn) userMenuBtn.onclick = toggleUserMenu;
+
+// Auth form wiring
+const loginForm = $('loginForm');
+if (loginForm) loginForm.onsubmit = authSignIn;
+const signupForm = $('signupForm');
+if (signupForm) signupForm.onsubmit = authSignUp;
+const forgotLink = $('forgotLink');
+if (forgotLink) forgotLink.onclick = e => { e.preventDefault(); authForgotPassword(); };
+const signOutBtn = $('signOutBtn');
+if (signOutBtn) signOutBtn.onclick = authSignOut;
+document.querySelectorAll('.auth-tab-btn').forEach(b => {
+  b.onclick = () => showAuthTab(b.dataset.tab);
+});
+
+// Handle share URL on load: /p/<slug>
+async function handleShareRoute() {
+  const path = window.location.pathname;
+  const slugMatch = path.match(/^\/p\/([a-z0-9]+)$/);
+  if (!slugMatch) return false;
+  const slug = slugMatch[1];
+  const proj = await loadPublicProject(slug);
+  if (!proj) {
+    appendMsg('assistant', 'Project not found or is private.');
+    return true;
   }
+  $('projectBadge').textContent = proj.name;
+  currentFiles = proj.files || {};
+  currentCode = Object.values(currentFiles).join('\n');
+  if (Object.keys(currentFiles).length > 0) {
+    updatePreview(currentFiles);
+    updateCodeDisplay(currentFiles);
+  }
+  appendMsg('assistant', `Viewing shared project: **${proj.name}**`);
+  return true;
+}
 
-  renderProjectSidebar(listProjects());
+// ══════════════════════════════════
+//  WINDOW INIT
+// ══════════════════════════════════
+window.onload = async () => {
+  updateTopbar();
+  loadAndRenderTemplates();
+
+  // Check if this is a share URL — load public project without auth
+  const isShareRoute = await handleShareRoute();
+  if (isShareRoute) return;
+
+  // Init Supabase Auth
+  await initAuth(async (user) => {
+    if (user) {
+      await onUserSignedIn(user);
+    } else {
+      // No session — show auth modal
+      showAuthModal('login');
+    }
+  });
+
   fetch('/skills-index.json').then(r => r.json()).then(d => { skillsIndex = d; }).catch(() => {});
 };
+
+console.log('✦ app.js loaded (v2 — Galaxy + Gemma merged)');

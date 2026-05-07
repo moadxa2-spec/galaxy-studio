@@ -3,7 +3,11 @@
 //  Agent tool system (inspired by Gemma Chat)
 // ═══════════════════════════════════════════
 
-const MAX_AGENT_ROUNDS = 15;
+// Max rounds per mode (code mode = 40, chat mode = 6)
+const MAX_AGENT_ROUNDS_CODE = 40;
+const MAX_AGENT_ROUNDS_CHAT = 6;
+// Keep a single constant for backwards compat
+const MAX_AGENT_ROUNDS = MAX_AGENT_ROUNDS_CODE;
 
 /**
  * Tool definitions. Each tool operates on the in-memory currentFiles object.
@@ -103,6 +107,81 @@ const TOOLS = {
       if (!ctx.files[p]) return `Error: file "${p}" not found.`;
       delete ctx.files[p];
       return `Deleted ${p}.`;
+    }
+  },
+
+  web_search: {
+    name: 'web_search',
+    description: 'Search the web for information. Returns a list of results with titles and snippets. Use for current data, APIs, libraries, or anything you need to look up.',
+    params: [
+      { name: 'query', description: 'search query string', required: true }
+    ],
+    example: '<action name="web_search">\n<query>Tailwind CSS grid responsive layout</query>\n</action>',
+    async run(args) {
+      const q = String(args.query || '').trim();
+      if (!q) return 'Error: missing <query>';
+      try {
+        const res = await fetch(`/proxy/search?q=${encodeURIComponent(q)}`);
+        if (!res.ok) return `Search error: HTTP ${res.status}`;
+        const data = await res.json();
+        if (!data.results?.length) return 'No results found.';
+        return data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.snippet}\n${r.url}`).join('\n\n');
+      } catch (e) {
+        return `Search error: ${e.message}`;
+      }
+    }
+  },
+
+  fetch_url: {
+    name: 'fetch_url',
+    description: 'Fetch the raw content of a URL (HTML, JSON, text). Use to read documentation, API responses, or any web page.',
+    params: [
+      { name: 'url', description: 'full URL to fetch (must start with http/https)', required: true },
+      { name: 'max_chars', description: 'max chars to return (default 8000)', required: false }
+    ],
+    example: '<action name="fetch_url">\n<url>https://api.github.com/repos/microsoft/vscode</url>\n</action>',
+    async run(args) {
+      const url = String(args.url || '').trim();
+      const max = Math.min(Number(args.max_chars || 8000), 50000);
+      if (!url) return 'Error: missing <url>';
+      if (!url.startsWith('http')) return 'Error: URL must start with http or https.';
+      try {
+        const res = await fetch('/proxy/fetch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        if (!res.ok) return `Fetch error: HTTP ${res.status}`;
+        const data = await res.json();
+        if (data.error) return `Fetch error: ${data.error}`;
+        const content = String(data.content || '').slice(0, max);
+        return `[Content-Type: ${data.contentType}]\n\n${content}`;
+      } catch (e) {
+        return `Fetch error: ${e.message}`;
+      }
+    }
+  },
+
+  calc: {
+    name: 'calc',
+    description: 'Evaluate a mathematical expression. Safe sandbox — no code execution. Use for calculations in code generation.',
+    params: [
+      { name: 'expression', description: 'math expression, e.g. (24 * 60) / 5', required: true }
+    ],
+    example: '<action name="calc">\n<expression>(1920 / 16) * 9</expression>\n</action>',
+    run(args) {
+      const expr = String(args.expression || '').trim();
+      if (!expr) return 'Error: missing <expression>';
+      // Safe evaluator — only allow numbers and math operators
+      if (!/^[\d\s+\-*/().%^,eE]+$/.test(expr)) return 'Error: only numeric math expressions allowed.';
+      try {
+        // Use Function constructor in a sandboxed way with only Math available
+        const result = new Function('Math', `"use strict"; return (${expr});`)(Math);
+        if (typeof result !== 'number' || !isFinite(result)) return 'Error: result is not a finite number.';
+        return String(result);
+      } catch (e) {
+        return `Error: ${e.message}`;
+      }
     }
   }
 };
