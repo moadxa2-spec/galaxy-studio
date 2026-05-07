@@ -299,12 +299,12 @@ function renderLiveCode(path, content, done) {
 }
 
 // ═══════════ PREVIEW ═══════════
-const CONSOLE_INJECT = \`<script>
+const CONSOLE_INJECT = `<script>
 (function(){var O={log:console.log,error:console.error,warn:console.warn,info:console.info};
 ['log','error','warn','info'].forEach(function(m){console[m]=function(){O[m].apply(console,arguments);
 try{window.parent.postMessage({type:'gs-console',method:m,args:Array.prototype.slice.call(arguments).map(function(a){return typeof a==='object'?JSON.stringify(a):String(a)})},'*')}catch(e){}}});
 window.addEventListener('error',function(e){window.parent.postMessage({type:'gs-console',method:'error',args:[e.message+' (line '+e.lineno+')']},'*')})})();
-<\/script>\`;
+<\/script>`;
 
 let _previewBlobUrl = null;
 
@@ -325,26 +325,26 @@ function updatePreview(filesOrHtml) {
       || names.find(f => f.endsWith('.html'));
 
     if (!htmlFile || !files[htmlFile] || !files[htmlFile].includes('<')) {
-      html = \`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+      html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
         <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f0f1a;color:#e0e0e0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
         .card{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:16px;padding:32px;max-width:480px;width:100%}.title{font-size:20px;font-weight:600;margin-bottom:16px;color:#a78bfa}
         .files{list-style:none;margin:0;padding:0}.file{display:flex;align-items:center;gap:10px;padding:8px 12px;margin:4px 0;background:#252542;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px}
         .icon{font-size:16px}.size{margin-left:auto;color:#666;font-size:11px}.hint{margin-top:16px;color:#888;font-size:12px;text-align:center}</style></head>
-        <body><div class="card"><div class="title">📁 Project Files (\${names.length})</div><ul class="files">\`;
+        <body><div class="card"><div class="title">📁 Project Files (\${names.length})</div><ul class="files">`;
       names.forEach(name => {
         const icon = getFileIcon(name);
         const lines = files[name].split('\\n').length;
-        html += \`<li class="file"><span class="icon">\${icon}</span>\${name}<span class="size">\${lines} lines</span></li>\`;
+        html += `<li class="file"><span class="icon">\${icon}</span>\${name}<span class="size">\${lines} lines</span></li>`;
       });
-      html += \`</ul><p class="hint">⬇ Download the project ZIP to use these files</p></div></body></html>\`;
+      html += `</ul><p class="hint">⬇ Download the project ZIP to use these files</p></div></body></html>`;
     } else {
       html = files[htmlFile] || '';
       // Inject CSS
       const cssFiles = Object.entries(files).filter(([f]) => f.endsWith('.css'));
       if (cssFiles.length > 0) {
-        const cssBlock = cssFiles.map(([name, content]) => \`<style>/* \${name} */\\n\${content}</style>\`).join('\\n');
+        const cssBlock = cssFiles.map(([name, content]) => `<style>/* \${name} */\\n\${content}</style>`).join('\\n');
         cssFiles.forEach(([name]) => {
-          const linkRe = new RegExp(\`<link[^>]*href=["']\${name.replace('.','\\\\.')}["'][^>]*/?>\`, 'gi');
+          const linkRe = new RegExp(`<link[^>]*href=["']\${name.replace('.','\\\\.')}["'][^>]*/?>`, 'gi');
           html = html.replace(linkRe, '');
         });
         html = html.replace('</head>', cssBlock + '\\n</head>');
@@ -352,9 +352,9 @@ function updatePreview(filesOrHtml) {
       // Inject JS
       const jsFiles = Object.entries(files).filter(([f]) => f.endsWith('.js'));
       if (jsFiles.length > 0) {
-        const jsBlock = jsFiles.map(([name, content]) => \`<script>/* \${name} */\\n\${content}<\\/script>\`).join('\\n');
+        const jsBlock = jsFiles.map(([name, content]) => `<script>/* \${name} */\\n\${content}<\/script>`).join('\\n');
         jsFiles.forEach(([name]) => {
-          const scriptRe = new RegExp(\`<script[^>]*src=["']\${name.replace('.','\\\\.')}["'][^>]*>\\\\s*</script>\`, 'gi');
+          const scriptRe = new RegExp(`<script[^>]*src=["']\${name.replace('.','\\\\.')}["'][^>]*>\\\\s*</script>`, 'gi');
           html = html.replace(scriptRe, '');
         });
         html = html.replace('</body>', jsBlock + '\\n</body>');
@@ -428,11 +428,11 @@ function updateCodeDisplay(filesOrCode) {
       const icon = getFileIcon(name);
       const lines = files[name].split('\\n').length;
       const isActive = name === activeFile ? 'active' : '';
-      return \`<div class="explorer-item \${isActive}" data-file="\${esc(name)}">
+      return `<div class="explorer-item \${isActive}" data-file="\${esc(name)}">
         <span class="explorer-item-icon">\${icon}</span>
         <span class="explorer-item-name">\${esc(name)}</span>
         <span class="explorer-item-lines">\${lines}L</span>
-      </div>\`;
+      </div>`;
     }).join('');
 
     treeEl.querySelectorAll('.explorer-item').forEach(item => {
@@ -447,11 +447,11 @@ function updateCodeDisplay(filesOrCode) {
     const icon = getFileIcon(name);
     const size = files[name].split('\\n').length;
     const isActive = name === activeFile ? 'active' : '';
-    return \`<button class="file-tab \${isActive}" data-file="\${esc(name)}">
+    return `<button class="file-tab \${isActive}" data-file="\${esc(name)}">
       <span class="file-tab-icon">\${icon}</span>
       <span class="file-tab-name">\${esc(name)}</span>
       <span class="file-tab-size">\${size}L</span>
-    </button>\`;
+    </button>`;
   }).join('');
 
   tabsEl.querySelectorAll('.file-tab').forEach(tab => {
@@ -462,7 +462,7 @@ function updateCodeDisplay(filesOrCode) {
   });
 
   const lang = getPrismLang(activeFile);
-  codeEl.className = \`language-\${lang}\`;
+  codeEl.className = `language-\${lang}`;
   codeEl.textContent = files[activeFile] || '';
   if (window.Prism) safeHighlight(codeEl);
 }
@@ -489,7 +489,7 @@ function updatePhaseUI() {
 
 function showTokenBadge(tokens) {
   const badge = $('tokenBadge');
-  badge.textContent = \`\${tokens} tokens\`;
+  badge.textContent = `\${tokens} tokens`;
   badge.classList.remove('hidden');
 }
 

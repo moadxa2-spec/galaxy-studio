@@ -497,11 +497,14 @@ async function fetchModels() {
       ];
       populateModelSelect(models);
     } else {
-      // Ollama: GET /api/tags
-      const baseUrl = ollamaUrlInput.value.trim() || 'http://localhost:11434';
-      const proxyBase = window.location.origin;
-      const targetUrl = `${baseUrl}/api/tags`;
-      const res = await fetch(`${proxyBase}/proxy?url=${encodeURIComponent(targetUrl)}`);
+      // Ollama: GET /api/tags (local hits the Ollama server directly via proxy)
+      const isCloud = p === 'ollama-cloud';
+      const baseUrl = isCloud ? '/proxy/ollama' : (ollamaUrlInput.value.trim() || 'http://localhost:11434');
+      const headers = {};
+      if (isCloud && apiKeyInput.value.trim()) {
+        headers['Authorization'] = `Bearer ${apiKeyInput.value.trim()}`;
+      }
+      const res = await fetch(`${baseUrl}/api/tags`, { headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const models = (data.models || []).map(m => m.name).filter(Boolean);
