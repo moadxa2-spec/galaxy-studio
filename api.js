@@ -178,17 +178,17 @@ async function callOllamaStream(opts, onToken) {
 
   if (isCloud) {
     if (!opts.apiKey) throw new Error('Ollama Cloud API key required. Open Settings.\n\nGet one at: https://ollama.com/settings/keys');
-    // Send key directly in Authorization header — server forwards it
+    // Cloud: route through our server proxy, key in Authorization header
     return callOllamaNative('/proxy/ollama', {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${opts.apiKey}`
     }, opts, onToken);
   } else {
-    // Route through server-side proxy to avoid browser CORS restrictions
-    const targetUrl = (opts.url || 'http://localhost:11434').replace(/\/$/, '');
-    return callOllamaNative('/proxy/ollama-local', {
-      'Content-Type': 'application/json',
-      'X-Ollama-Url': targetUrl
+    // Local: call localhost directly (server can't reach user's machine)
+    // Requires Ollama to be started with: OLLAMA_ORIGINS="*" ollama serve
+    const base = (opts.url || 'http://localhost:11434').replace(/\/$/, '');
+    return callOllamaNative(base, {
+      'Content-Type': 'application/json'
     }, opts, onToken);
   }
 }
@@ -316,12 +316,10 @@ async function fetchAvailableModels(provider, apiKey, url) {
       return (data.models || []).map(m => m.name).filter(Boolean);
     } catch { return []; }
   }
-  // ollama-local — route through server proxy to avoid CORS
+  // ollama-local — call localhost directly (tags fetch is same-machine, no CORS issue in settings)
   try {
-    const targetUrl = (url || 'http://localhost:11434').replace(/\/$/, '');
-    const res = await fetch('/proxy/ollama-local/api/tags', {
-      headers: { 'X-Ollama-Url': targetUrl }
-    });
+    const base = (url || 'http://localhost:11434').replace(/\/$/, '');
+    const res = await fetch(`${base}/api/tags`);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     return (data.models || []).map(m => m.name).filter(Boolean);

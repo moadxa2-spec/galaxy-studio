@@ -123,83 +123,12 @@ function proxyRequest(targetBase, req, res) {
   });
 }
 
-// ── LOCAL OLLAMA PROXY (avoids browser CORS) ──
-function proxyOllamaLocal(req, res) {
-  const rawTarget = req.headers['x-ollama-url'] || 'http://localhost:11434';
-  let targetOrigin;
-  try {
-    const u = new URL(rawTarget);
-    if (!['http:', 'https:'].includes(u.protocol)) throw new Error('bad protocol');
-    targetOrigin = u.origin;
-  } catch {
-    return res.status(400).json({ error: 'Invalid X-Ollama-Url header.' });
-  }
-
-  const fullUrl = targetOrigin + req.path;
-  let url;
-  try { url = new URL(fullUrl); } catch {
-    return res.status(400).json({ error: 'Invalid proxy target URL.' });
-  }
-
-  const isHttps = url.protocol === 'https:';
-  const mod = isHttps ? https : require('http');
-  const port = url.port ? parseInt(url.port) : (isHttps ? 443 : 80);
-
-  const chunks = [];
-  req.on('data', c => chunks.push(c));
-  req.on('end', () => {
-    const body = Buffer.concat(chunks);
-    const headers = {
-      'Content-Type': req.headers['content-type'] || 'application/json',
-      'User-Agent': 'GalaxyStudio/2.0'
-    };
-    if (body.length > 0) headers['Content-Length'] = body.length;
-
-    const options = {
-      hostname: url.hostname,
-      port,
-      path: url.pathname + url.search,
-      method: req.method,
-      headers
-    };
-
-    const proxyReq = mod.request(options, proxyRes => {
-      const resHeaders = {
-        'Content-Type': proxyRes.headers['content-type'] || 'application/json',
-        'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': ALLOWED_ORIGIN === '*' ? '*' : (req.headers.origin || '')
-      };
-      if (proxyRes.headers['transfer-encoding']) {
-        resHeaders['Transfer-Encoding'] = proxyRes.headers['transfer-encoding'];
-      }
-      res.writeHead(proxyRes.statusCode, resHeaders);
-      proxyRes.pipe(res, { end: true });
-    });
-
-    proxyReq.on('error', err => {
-      console.error('[ollama-local proxy error]', err.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: `Cannot reach Ollama at ${targetOrigin}: ${err.message}` });
-      }
-    });
-
-    proxyReq.setTimeout(120000, () => {
-      proxyReq.destroy();
-      if (!res.headersSent) res.status(408).json({ error: 'Ollama request timed out' });
-    });
-
-    if (body.length > 0) proxyReq.write(body);
-    proxyReq.end();
-  });
-}
-
 // ── PROXY ROUTES ──
 app.use('/proxy/gemini',     proxyLimiter, (req, res) => proxyRequest('https://generativelanguage.googleapis.com', req, res));
 app.use('/proxy/ollama',     proxyLimiter, (req, res) => proxyRequest('https://ollama.com', req, res));
 app.use('/proxy/anthropic',  proxyLimiter, (req, res) => proxyRequest('https://api.anthropic.com', req, res));
 app.use('/proxy/openai',     proxyLimiter, (req, res) => proxyRequest('https://api.openai.com', req, res));
 app.use('/proxy/openrouter', proxyLimiter, (req, res) => proxyRequest('https://openrouter.ai', req, res));
-app.use('/proxy/ollama-local', proxyLimiter, (req, res) => proxyOllamaLocal(req, res));
 
 // ── WEB SEARCH PROXY (DuckDuckGo — no key needed) ──
 app.get('/proxy/search', proxyLimiter, async (req, res) => {
@@ -269,12 +198,12 @@ app.listen(PORT, () => {
   console.log(`\n  ✦ Galaxy Studio server running at:`);
   console.log(`    → http://localhost:${PORT}`);
   console.log(`  Proxy routes:`);
-  console.log(`    /proxy/gemini       → generativelanguage.googleapis.com`);
-  console.log(`    /proxy/ollama       → ollama.com`);
-  console.log(`    /proxy/anthropic    → api.anthropic.com`);
-  console.log(`    /proxy/openai       → api.openai.com`);
-  console.log(`    /proxy/openrouter   → openrouter.ai`);
-  console.log(`    /proxy/ollama-local → local Ollama (server-side, no CORS)`);
-  console.log(`    /proxy/search       → DuckDuckGo`);
-  console.log(`    /proxy/fetch        → URL fetcher\n`);
+  console.log(`    /proxy/gemini     → generativelanguage.googleapis.com`);
+  console.log(`    /proxy/ollama     → ollama.com (Ollama Cloud)`);
+  console.log(`    /proxy/anthropic  → api.anthropic.com`);
+  console.log(`    /proxy/openai     → api.openai.com`);
+  console.log(`    /proxy/openrouter → openrouter.ai`);
+  console.log(`    /proxy/search     → DuckDuckGo`);
+  console.log(`    /proxy/fetch      → URL fetcher`);
+  console.log(`  Local Ollama calls http://localhost:11434 directly from browser\n`);
 });
