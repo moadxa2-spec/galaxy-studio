@@ -352,6 +352,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);heigh
 .tool-result-text{font-size:11px;color:var(--text3)}
 @keyframes toolPulse{0%,100%{opacity:1}50%{opacity:.5}}
 
+.stream-interrupted-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;margin:8px 0;background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.3);border-radius:10px;font-size:12px;color:var(--orange)}
+.stream-interrupted-bar span{flex:1}
+.stream-interrupted-bar button{padding:4px 12px;border-radius:6px;border:1px solid rgba(249,115,22,.4);background:rgba(249,115,22,.15);color:var(--orange);font-size:11px;cursor:pointer;white-space:nowrap}
+.stream-interrupted-bar button:hover{background:rgba(249,115,22,.25)}
+
 /* ═══════════════════════════════════════
    MARKDOWN BODY (rendered AI responses)
 ═══════════════════════════════════════ */

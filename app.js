@@ -252,16 +252,22 @@ async function sendMessage() {
       const bubble = replyDiv.querySelector('.msg-bubble');
       chatHistory.appendChild(replyDiv);
 
-      // Tool activity badge container
+      // Tool activity badge container (shown after reply, once thinking bubble is gone)
       const activityBar = document.createElement('div');
       activityBar.className = 'tool-activity-bar';
       replyDiv.appendChild(activityBar);
 
       function showActivity(text) {
+        // Show in thinking bubble while it's still visible (during initial stream)
+        updateThinkingStep(text);
+        // Also show in activity bar below the reply (after thinking bubble removed)
         activityBar.innerHTML = `<span class="tool-badge running">${esc(text)}</span>`;
         chatHistory.scrollTop = chatHistory.scrollHeight;
       }
-      function clearActivity() { activityBar.innerHTML = ''; }
+      function clearActivity() {
+        updateThinkingStep('');
+        activityBar.innerHTML = '';
+      }
 
       const res = await streamChat(opts, (chunk) => {
         if (chunk.type === 'token') {
@@ -393,6 +399,7 @@ async function sendMessage() {
     removeThinking();
     isStreaming = false;
     window._pendingStream = false;
+    _hiddenWhileStreaming = false;
     if (stopBtn) stopBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
     sendBtn.disabled = false;
@@ -686,12 +693,38 @@ window.addEventListener('message', (e) => {
   countEl.classList.remove('hidden');
 });
 
-// ═══════════ BEFOREUNLOAD ═══════════
+// ═══════════ BEFOREUNLOAD (page close/navigate only) ═══════════
 
 window.addEventListener('beforeunload', e => {
-  if (window._pendingStream || isStreaming) {
+  // Only warn on actual page unload, not tab switches
+  if (isStreaming) {
     e.preventDefault();
     e.returnValue = 'Generation is still running. Leave anyway?';
+  }
+});
+
+// ═══════════ VISIBILITY CHANGE (tab switch) ═══════════
+// Chrome may throttle streaming fetches when the tab is hidden.
+// When returning to the tab, if the stream silently died, show a retry prompt.
+let _hiddenWhileStreaming = false;
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && isStreaming) {
+    _hiddenWhileStreaming = true;
+  }
+  if (document.visibilityState === 'visible' && _hiddenWhileStreaming) {
+    _hiddenWhileStreaming = false;
+    // If streaming already cleaned up (AbortError was swallowed), offer retry
+    if (!isStreaming) {
+      const retryBar = document.createElement('div');
+      retryBar.className = 'stream-interrupted-bar';
+      retryBar.innerHTML = `
+        <span>Generation may have been interrupted while the tab was in the background.</span>
+        <button onclick="regenerateLast(); this.parentElement.remove()">Retry</button>
+        <button onclick="this.parentElement.remove()">Dismiss</button>`;
+      chatHistory.appendChild(retryBar);
+      chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
   }
 });
 

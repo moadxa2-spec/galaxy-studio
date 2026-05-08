@@ -50,7 +50,7 @@ const THINKING_STEPS = {
 function appendThinking() {
   const div = document.createElement('div');
   div.className = 'msg assistant'; div.id = 'thinkingBubble';
-  const phaseLabel = phase === 'planning' ? '🤔 Planning' : phase === 'building' ? '🏗️ Building' : '🔧 Refining';
+  const phaseLabel = phase === 'planning' ? 'Planning' : phase === 'building' ? 'Building' : 'Refining';
   div.innerHTML = `<div class="msg-role">${esc(cfg.model || 'AI')}</div>
     <div class="thinking-rich">
       <div class="thinking-header">
@@ -62,22 +62,30 @@ function appendThinking() {
     </div>`;
   chatHistory.appendChild(div);
   chatHistory.scrollTop = chatHistory.scrollHeight;
-  
-  // Start timer
+
   thinkingStartTime = Date.now();
   let stepIdx = 0;
   const steps = THINKING_STEPS[phase] || ['Thinking...'];
   thinkingTimer = setInterval(() => {
     const elapsed = Math.round((Date.now() - thinkingStartTime) / 1000);
     const timeEl = $('thinkingTime');
-    const stepEl = $('thinkingStep');
     if (timeEl) timeEl.textContent = elapsed + 's';
-    if (stepEl && elapsed > 0 && elapsed % 4 === 0) {
+    // Only auto-cycle steps if no external activity text has been set
+    const stepEl = $('thinkingStep');
+    if (stepEl && !stepEl.dataset.locked && elapsed > 0 && elapsed % 4 === 0) {
       stepIdx = Math.min(stepIdx + 1, steps.length - 1);
       stepEl.textContent = steps[stepIdx];
     }
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }, 1000);
+}
+
+// Update the thinking bubble's step text with live activity (e.g. "writing index.html...")
+function updateThinkingStep(text) {
+  const stepEl = $('thinkingStep');
+  if (!stepEl) return;
+  stepEl.textContent = text;
+  stepEl.dataset.locked = text ? '1' : '';
 }
 
 function removeThinking() {
