@@ -178,11 +178,8 @@ async function callOllamaStream(opts, onToken) {
 
   if (isCloud) {
     if (!opts.apiKey) throw new Error('Ollama Cloud API key required. Open Settings.\n\nGet one at: https://ollama.com/settings/keys');
-    // Cloud: route through our server proxy, key in Authorization header
-    return callOllamaNative('/proxy/ollama', {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${opts.apiKey}`
-    }, opts, onToken);
+    // Cloud uses OpenAI-compatible /v1/chat/completions endpoint
+    return callOllamaCloudStream(opts, onToken);
   } else {
     // Local: call localhost directly (server can't reach user's machine)
     // Requires Ollama to be started with: OLLAMA_ORIGINS="*" ollama serve
@@ -191,6 +188,38 @@ async function callOllamaStream(opts, onToken) {
       'Content-Type': 'application/json'
     }, opts, onToken);
   }
+}
+
+async function callOllamaCloudStream(opts, onToken) {
+  const signal = newAbortSignal();
+  const res = await fetch('/proxy/ollama/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${opts.apiKey}`
+    },
+    body: JSON.stringify({
+      model: opts.model,
+      stream: true,
+      max_tokens: opts.maxTokens || 64000,
+      messages: [{ role: 'system', content: opts.systemPrompt }, ...opts.messages]
+    }),
+    signal
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    if (res.status === 401) throw new Error('401 Unauthorized — Invalid Ollama Cloud API key.\n\nGet a new key at: https://ollama.com/settings/keys');
+    if (res.status === 403) throw new Error('403 Forbidden — Ollama Cloud API key was rejected.\n\nCheck your key at: https://ollama.com/settings/keys');
+    throw new Error(parseApiErr(t, res.status));
+  }
+
+  return readSSE(res, line => {
+    if (line === '[DONE]') return null;
+    const j = JSON.parse(line);
+    const delta = j.choices?.[0]?.delta?.content || '';
+    return { text: delta, tokens: j.usage?.total_tokens || null };
+  }, onToken);
 }
 
 async function callOllamaNative(baseUrl, headers, opts, onToken) {
@@ -308,12 +337,15 @@ async function fetchAvailableModels(provider, apiKey, url) {
   }
   if (provider === 'ollama-cloud') {
     try {
-      const res = await fetch('/proxy/ollama/api/tags', {
+      const res = await fetch('/proxy/ollama/v1/models', {
         headers: { 'Authorization': `Bearer ${apiKey}` }
       });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      return (data.models || []).map(m => m.name).filter(Boolean);
+      // OpenAI-compatible format: { data: [{ id: "model-name" }] }
+      // Also handle native format: { models: [{ name: "model-name" }] }
+      const models = data.data || data.models || [];
+      return models.map(m => m.id || m.name).filter(Boolean);
     } catch { return []; }
   }
   // ollama-local — call localhost directly (tags fetch is same-machine, no CORS issue in settings)
