@@ -111,9 +111,19 @@ function proxyRequest(targetBase, req, res) {
       }
       res.writeHead(proxyRes.statusCode, resHeaders);
       proxyRes.pipe(res, { end: true });
+
+      // If client disconnects, abort the upstream request
+      res.on('close', () => { proxyReq.destroy(); });
+    });
+
+    // 5 min timeout for streaming AI responses (models can be slow)
+    proxyReq.setTimeout(5 * 60 * 1000, () => {
+      proxyReq.destroy();
+      if (!res.headersSent) res.status(504).json({ error: 'Upstream AI request timed out after 5 minutes.' });
     });
 
     proxyReq.on('error', err => {
+      if (err.code === 'ECONNRESET' || err.message.includes('socket hang up')) return; // client closed connection
       console.error('[proxy error]', err.message);
       if (!res.headersSent) res.status(502).json({ error: `Proxy error: ${err.message}` });
     });

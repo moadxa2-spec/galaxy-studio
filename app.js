@@ -210,9 +210,6 @@ async function sendMessage() {
   const userText = promptEl.value.trim();
   if (!userText) return;
 
-  // Warn if streaming will navigate away
-  window._pendingStream = true;
-
   promptEl.value = '';
   lastUserMessage = userText;
   isStreaming = true;
@@ -423,7 +420,6 @@ async function sendMessage() {
   } finally {
     removeThinking();
     isStreaming = false;
-    window._pendingStream = false;
     _hiddenWhileStreaming = false;
     if (stopBtn) stopBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
@@ -718,15 +714,8 @@ window.addEventListener('message', (e) => {
   countEl.classList.remove('hidden');
 });
 
-// ═══════════ BEFOREUNLOAD (page close/navigate only) ═══════════
-
-window.addEventListener('beforeunload', e => {
-  // Only warn on actual page unload, not tab switches
-  if (isStreaming) {
-    e.preventDefault();
-    e.returnValue = 'Generation is still running. Leave anyway?';
-  }
-});
+// Projects auto-save to Supabase — no data loss on page close.
+// We intentionally do NOT block beforeunload to avoid the "Leave site?" dialog.
 
 // ═══════════ VISIBILITY CHANGE (tab switch) ═══════════
 // Chrome may throttle streaming fetches when the tab is hidden.
