@@ -143,6 +143,16 @@ function handleBuildResult(text, tokens, userText, secs) {
     if (Object.keys(extracted).length > 0) Object.assign(currentFiles, extracted);
   }
 
+  const fileCount = Object.keys(currentFiles).length;
+
+  // Nothing was written — AI responded with text only (error/question during build)
+  if (fileCount === 0) {
+    messages.push({ role: 'assistant', content: text });
+    persistMessage(currentProjectId, { role: 'assistant', content: text, model: cfg.model });
+    if (tokens) showTokenBadge(tokens);
+    return;
+  }
+
   currentCode = Object.values(currentFiles).join('\n');
   messages.push({ role: 'assistant', content: text });
 
@@ -151,12 +161,10 @@ function handleBuildResult(text, tokens, userText, secs) {
   currentVersion = versions.length - 1;
   updateVersionNav();
 
-  // Persist version to Supabase
   persistVersion(currentProjectId, currentVersion, versionData);
 
   const totalLines = Object.values(currentFiles).reduce((s, c) => s + c.split('\n').length, 0);
-  const fileCount = Object.keys(currentFiles).length;
-  let summary = `Built in ${secs}s — ${fileCount} files, ${totalLines} lines`;
+  let summary = `Built in ${secs}s — ${fileCount} file${fileCount !== 1 ? 's' : ''}, ${totalLines} lines`;
   if (tokens) summary += ` · ${tokens} tokens`;
 
   appendMsg('assistant', summary);
@@ -358,8 +366,9 @@ async function sendMessage() {
       removeThinking();
       const secs = Math.round((Date.now() - thinkingStartTime) / 1000);
 
-      // Final markdown render (replace partial streaming render with full clean render)
-      bubble.innerHTML = renderMarkdown(currentResponse.replace(/<action[\s\S]*?<\/action>/gi, '').trim());
+      // Strip raw <action> XML from the visible bubble, render markdown cleanly
+      const visibleText = currentResponse.replace(/<action[\s\S]*?<\/action>/gi, '').trim();
+      bubble.innerHTML = renderMarkdown(visibleText);
 
       if (chatMode === 'chat') {
         messages.push({ role: 'assistant', content: currentResponse });
@@ -375,7 +384,23 @@ async function sendMessage() {
           renderQuestions(currentResponse, secs, totalTokens);
         }
       } else {
-        handleBuildResult(currentResponse, totalTokens, userText, secs);
+        // Build / refine mode
+        const hasFiles = Object.keys(ctx.files).length > 0;
+        const filesChanged = JSON.stringify(ctx.files) !== JSON.stringify(currentFiles);
+
+        if (filesChanged || (isToolMode && hasFiles)) {
+          // AI wrote or edited files — update the project
+          handleBuildResult(currentResponse, totalTokens, userText, secs);
+        } else if (isToolMode && !filesChanged && !currentResponse.includes('<action')) {
+          // AI replied in plain text during build mode (error, question, explanation)
+          // Show the message as a plain assistant bubble and push to history
+          messages.push({ role: 'assistant', content: currentResponse });
+          persistMessage(currentProjectId, { role: 'assistant', content: currentResponse, model: cfg.model });
+          if (totalTokens) showTokenBadge(totalTokens);
+          // If the project has files already, keep the preview as-is
+        } else {
+          handleBuildResult(currentResponse, totalTokens, userText, secs);
+        }
       }
 
       break;
